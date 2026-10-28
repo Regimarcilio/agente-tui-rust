@@ -101,3 +101,102 @@ Se agente encontrar **bloqueio real** (dependência externa, bug em crate, decis
 ---
 
 > **Princípio:** "Melhor pedir perdão que permissão" — desde que dentro do escopo documentado e com commits reversíveis em `develop`.
+
+---
+
+## 10. Sincronização Multi-PC / Anti-Colisão (Obrigatório)
+
+### 10.1 Auto Pull em Idle (> 2h)
+**Regra:** Antes da **primeira requisição** após período de inatividade ≥ 2 horas no mesmo workspace, o agente **deve executar automaticamente**:
+```bash
+git fetch origin
+git status -sb
+# Se houver commits remotos na branch atual:
+git pull --rebase origin <branch-atual>
+# Se houver divergência (local commits não empurrados):
+git stash push -m "auto-stash pre-pull $(date -Iseconds)" && git pull --rebase origin <branch-atual> && git stash pop
+```
+
+**Implementação:** Verificar `git log -1 --format=%ct` vs `date +%s`; se delta > 7200s → executar pull.
+
+### 10.2 Detecção e Desvio de Colisão de Branch
+**Regra:** Antes de iniciar trabalho em branch compartilhada (`develop`, `ISSUE-*`, `DEV-*`, `SEG-*`, `DOC-*`), o agente **deve verificar**:
+```bash
+# 1. Verificar se branch existe remoto e tem commits novos
+git fetch origin <branch>
+git rev-list --left-right --count HEAD...origin/<branch>
+
+# 2. Se origin/<branch> tem commits que não temos (outro PC empurrou):
+#    → Criar branch de trabalho derivada: <tipo>-<original>-<hostname>-<timestamp>
+#    Ex: DEV-1234-pc-casa-20261028-143000
+#    → Fazer checkout na nova branch
+#    → Continuar trabalho normalmente
+
+# 3. Se temos commits locais não empurrados E origin tem commits novos:
+#    → Stash local → pull rebase → pop stash → continuar
+#    → Se conflito: abrir issue de merge manual (question tool)
+```
+
+**Nomenclatura de branch derivada (anti-colisão):**
+| Tipo Original | Derivada (exemplo) |
+|---------------|---------------------|
+| `develop` | `DEV-sync-<hostname>-<YYYYMMDD-HHMMSS>` |
+| `ISSUE-42` | `ISSUE-42-<hostname>-<YYYYMMDD-HHMMSS>` |
+| `DEV-auth` | `DEV-auth-<hostname>-<YYYYMMDD-HHMMSS>` |
+| `SEG-cve` | `SEG-cve-<hostname>-<YYYYMMDD-HHMMSS>` |
+| `DOC-srs` | `DOC-srs-<hostname>-<YYYYMMDD-HHMMSS>` |
+
+**Hostname:** Usar `hostname -s` (short) ou variável `FERRO_HOST_ID` configurada no profile.toml.
+
+### 10.3 Checklist Obrigatório Início de Sessão
+Todo agente, ao receber **primeira task** da sessão, deve executar e registrar:
+
+```bash
+# 1. Verificar idle time
+LAST_COMMIT=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+NOW=$(date +%s)
+IDLE=$((NOW - LAST_COMMIT))
+
+# 2. Se IDLE > 7200 (2h): auto pull
+if [ $IDLE -gt 7200 ]; then
+  git fetch origin
+  git pull --rebase origin $(git branch --show-current) 2>/dev/null || true
+fi
+
+# 3. Verificar colisão na branch atual
+BRANCH=$(git branch --show-current)
+git fetch origin $BRANCH 2>/dev/null
+BEHIND=$(git rev-list --count HEAD..origin/$BRANCH 2>/dev/null || echo 0)
+AHEAD=$(git rev-list --count origin/$BRANCH..HEAD 2>/dev/null || echo 0)
+
+if [ $BEHIND -gt 0 ] && [ $AHEAD -eq 0 ]; then
+  # Só remoto tem novidades: pull rebase direto
+  git pull --rebase origin $BRANCH
+elif [ $BEHIND -gt 0 ] && [ $AHEAD -gt 0 ]; then
+  # Ambos têm commits: derivar branch anti-colisão
+  NEW_BRANCH="${BRANCH}-$(hostname -s)-$(date +%Y%m%d-%H%M%S)"
+  git checkout -b "$NEW_BRANCH"
+  echo "⚠️ Colisão detectada: mudado para branch derivada $NEW_BRANCH"
+fi
+
+# 4. Log da sincronização
+echo "[$(date -Iseconds)] Sync: branch=$BRANCH, idle=${IDLE}s, behind=$BEHIND, ahead=$AHEAD" >> .ferro-sync.log
+```
+
+### 10.4 Configuração no Profile (dotfiles)
+Adicionar ao `profile.toml` (sync via `ferro --sync-profile`):
+
+```toml
+[git.sync]
+auto_pull_idle_hours = 2           # Padrão: 2h
+anti_collision_enabled = true      # Padrão: true
+host_id = "pc-casa"                # Override hostname (opcional)
+preferred_remote = "origin"        # Remote padrão
+rebase_instead_of_merge = true     # Sempre rebase
+stash_before_pull = true           # Stash automático se divergência
+log_file = ".ferro-sync.log"       # Log local de sincronizações
+```
+
+---
+
+> **Nota:** Estas regras valem para **todos os agentes** (planmaster, backdev, frontdev, engai, kalimaster, opsmaster, qamaster, etc.) e devem ser injetadas no prompt de despacho via `task`.
